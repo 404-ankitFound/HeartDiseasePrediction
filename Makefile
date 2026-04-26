@@ -1,21 +1,76 @@
-TOMCAT_HOME  := $(shell brew --prefix tomcat@9 2>/dev/null)/libexec
-JAVA_HOME    := $(shell asdf where java 2>/dev/null || /usr/libexec/java_home 2>/dev/null)
+# ============================================================
+# Cross-platform OS detection
+#   Windows : requires Git Bash (git-scm.com) + GNU Make
+#   macOS   : Homebrew-based tooling
+#   Linux   : systemd / apt assumed
+# ============================================================
+ifeq ($(OS),Windows_NT)
+    DETECTED_OS  := Windows
+    # Point CATALINA_HOME at your Tomcat 9 install dir, or override TOMCAT_HOME
+    TOMCAT_HOME  ?= $(CATALINA_HOME)
+    # JAVA_HOME must already be set in your Windows environment
+    JAVA_HOME    ?= $(JAVA_HOME)
+    TOMCAT_START := cmd /C "$(TOMCAT_HOME)/bin/startup.bat"
+    TOMCAT_STOP  := cmd /C "$(TOMCAT_HOME)/bin/shutdown.bat"
+    PG_SVC_START := net start postgresql-x64-15
+    PG_SVC_STOP  := net stop postgresql-x64-15
+    PKG_INSTALL  := choco install -y
+    PG_PKGS      := postgresql15
+    TOMCAT_PKG   := tomcat
+    PYTHON       := python
+    RM_F         := rm -f
+else
+    UNAME_S      := $(shell uname -s)
+    PYTHON       := python3
+    RM_F         := rm -f
+    ifeq ($(UNAME_S),Darwin)
+        DETECTED_OS  := macOS
+        TOMCAT_HOME  := $(shell brew --prefix tomcat@9 2>/dev/null)/libexec
+        JAVA_HOME    := $(shell asdf where java 2>/dev/null || /usr/libexec/java_home 2>/dev/null)
+        PG_SVC_START := brew services start postgresql@15
+        PG_SVC_STOP  := brew services stop postgresql@15
+        PKG_INSTALL  := brew install
+        PG_PKGS      := postgresql@15
+        TOMCAT_PKG   := tomcat@9
+    else
+        DETECTED_OS  := Linux
+        TOMCAT_HOME  ?= /opt/tomcat
+        JAVA_HOME    ?= $(shell dirname $$(dirname $$(readlink -f $$(which java))))
+        PG_SVC_START := sudo systemctl start postgresql
+        PG_SVC_STOP  := sudo systemctl stop postgresql
+        PKG_INSTALL  := sudo apt-get install -y
+        PG_PKGS      := postgresql-15
+        TOMCAT_PKG   := tomcat9
+    endif
+    TOMCAT_START := $(TOMCAT_HOME)/bin/startup.sh
+    TOMCAT_STOP  := $(TOMCAT_HOME)/bin/shutdown.sh
+endif
 export JAVA_HOME
-DB_NAME      := heart_disease_project
-DB_USER      := postgres
-DB_PASS      := Ankit@4837
-DB_PORT      := 5432
-FLASK_DIR    := DataModel
-WAR_NAME     := Heart_Disease
 
-.PHONY: all setup start stop db-start db-stop db-init scaler flask-start app-build app-start clean
+DB_NAME   := heart_disease_project
+DB_USER   := postgres
+DB_PASS   := Ankit@4837
+DB_PORT   := 5432
+FLASK_DIR := DataModel
+WAR_NAME  := Heart_Disease
+
+.PHONY: all setup start stop db-start db-stop db-init scaler flask-start flask-stop app-build app-start app-stop clean
 
 all: start
 
-## Install Tomcat 9 and PostgreSQL 15 via Homebrew (one-time setup)
+## Install Tomcat 9 and PostgreSQL (one-time setup)
 setup:
+ifeq ($(DETECTED_OS),Windows)
+	@echo "==> Installing Tomcat 9 and PostgreSQL 15 via Chocolatey..."
+	choco install -y $(TOMCAT_PKG) $(PG_PKGS)
+	@echo "==> Set CATALINA_HOME and ensure the PostgreSQL bin dir is in PATH."
+else ifeq ($(DETECTED_OS),macOS)
+	@echo "==> Installing Tomcat 9 and PostgreSQL 15 via Homebrew..."
+	brew install $(TOMCAT_PKG) $(PG_PKGS)
+else
 	@echo "==> Installing Tomcat 9 and PostgreSQL 15..."
-	brew install tomcat@9 postgresql@15
+	$(PKG_INSTALL) $(TOMCAT_PKG) $(PG_PKGS)
+endif
 	@echo "==> Setup complete. Run 'make start' to launch the app."
 
 ## Start everything: database, ML server, web app
@@ -33,8 +88,8 @@ stop: app-stop flask-stop db-stop
 # --- Database ---
 
 db-start:
-	@echo "==> Starting PostgreSQL 15 (Homebrew)..."
-	@brew services start postgresql@15
+	@echo "==> Starting PostgreSQL..."
+	@$(PG_SVC_START) || echo "PostgreSQL may already be running."
 	@echo "==> Waiting for PostgreSQL to be ready..."
 	@until pg_isready -q -p $(DB_PORT); do sleep 1; done
 	@$(MAKE) -s db-init
@@ -52,16 +107,16 @@ db-init:
 
 db-stop:
 	@echo "==> Stopping PostgreSQL..."
-	@brew services stop postgresql@15
+	@$(PG_SVC_STOP) || true
 
 # --- ML artifacts ---
 
 ## Regenerate scaler.pkl from heart.csv (no notebook needed)
 scaler:
 	@echo "==> Installing Python dependencies..."
-	@pip install -q pandas scikit-learn joblib flask
+	@$(PYTHON) -m pip install -q pandas scikit-learn joblib flask
 	@echo "==> Generating scaler.pkl..."
-	@python $(FLASK_DIR)/gen_scaler.py
+	@$(PYTHON) $(FLASK_DIR)/gen_scaler.py
 	@echo "==> Done: $(FLASK_DIR)/scaler.pkl"
 
 # --- Flask ML server ---
@@ -69,7 +124,7 @@ scaler:
 flask-start:
 	@[ -f "$(FLASK_DIR)/scaler.pkl" ] || $(MAKE) scaler
 	@echo "==> Starting Flask ML server..."
-	@cd $(FLASK_DIR) && nohup python app.py > ../flask.log 2>&1 & echo $$! > ../flask.pid
+	@cd $(FLASK_DIR) && nohup $(PYTHON) app.py > ../flask.log 2>&1 & echo $$! > ../flask.pid
 	@sleep 2
 	@echo "==> Flask running at http://127.0.0.1:5000 (logs: flask.log)"
 
@@ -77,7 +132,7 @@ flask-stop:
 	@echo "==> Stopping Flask ML server..."
 	@if [ -f flask.pid ]; then \
 		kill $$(cat flask.pid) 2>/dev/null || true; \
-		rm -f flask.pid; \
+		$(RM_F) flask.pid; \
 	fi
 
 # --- Java web app ---
@@ -91,23 +146,23 @@ app-start: app-build
 	@if [ ! -d "$(TOMCAT_HOME)" ]; then \
 		echo ""; \
 		echo "ERROR: Tomcat not found at $(TOMCAT_HOME)."; \
-		echo "       Run 'make setup' first to install Tomcat 9."; \
+		echo "       Run 'make setup' first, or set CATALINA_HOME (Windows) / TOMCAT_HOME."; \
 		echo ""; \
 		exit 1; \
 	fi
 	@echo "==> Deploying to Tomcat..."
-	@cp target/$(WAR_NAME).war $(TOMCAT_HOME)/webapps/
-	@$(TOMCAT_HOME)/bin/startup.sh
+	@cp "target/$(WAR_NAME).war" "$(TOMCAT_HOME)/webapps/"
+	@$(TOMCAT_START)
 	@echo "==> App running at http://localhost:8080/$(WAR_NAME)/"
 
 app-stop:
 	@echo "==> Stopping Tomcat..."
-	@$(TOMCAT_HOME)/bin/shutdown.sh 2>/dev/null || true
+	@$(TOMCAT_STOP) 2>/dev/null || true
 
 # --- Cleanup ---
 
 clean: stop
 	@echo "==> Cleaning build artifacts..."
 	@mvn clean -q
-	@rm -f flask.pid flask.log
+	@$(RM_F) flask.pid flask.log
 	@echo "==> Clean complete."
